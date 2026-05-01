@@ -380,7 +380,9 @@ class PackagesEnvChecker:
         return self.packages_info
 
     def _on_mi3xx(self):
-        gcn_arch_name = torch.cuda.get_device_properties().gcnArchName
+        if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+            return False
+        gcn_arch_name = torch.cuda.get_device_properties(0).gcnArchName
         return any(arch in gcn_arch_name for arch in ["gfx950", "gfx942"])
 
 

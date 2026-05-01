@@ -1,0 +1,53 @@
+# xDiT Service — Docker Compose for 4x A40 deployment
+#
+# Deploy:
+#   docker compose -f docker/docker-compose.yml up -d --build
+#
+# Verify:
+#   curl http://localhost:6000/health
+#   curl http://localhost:6000/models
+
+services:
+  xdit-service:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.service
+    container_name: xdit-service
+    restart: unless-stopped
+
+    ports:
+      - "${XDIT_PORT:-6000}:6000"
+
+    volumes:
+      - ${MODELS_PATH:-/data/models}:/models
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NCCL_P2P_DISABLE=0
+      - NCCL_IB_DISABLE=1
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Required for NCCL shared-memory communication between GPUs
+    ipc: host
+    # Required for Ray
+    shm_size: "16g"
+
+    command:
+      - "--model_path"
+      - "${XDIT_MODEL:-/models/FLUX.1-dev}"
+      - "--world_size"
+      - "${XDIT_WORLD_SIZE:-4}"
+      - "--ulysses_degree"
+      - "${XDIT_ULYSSES:-2}"
+      - "--ring_degree"
+      - "${XDIT_RING:-1}"
+      - "--pipefusion_degree"
+      - "${XDIT_PIPEFUSION:-1}"
+      - "${XDIT_CFG_FLAG:---use_cfg_parallel}"

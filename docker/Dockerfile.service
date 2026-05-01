@@ -1,0 +1,39 @@
+# xDiT Inference Service — Docker image for multi-GPU parallel inference
+# Base: NVIDIA PyTorch (includes CUDA, cuDNN, NCCL, PyTorch)
+
+FROM nvcr.io/nvidia/pytorch:24.07-py3
+
+WORKDIR /workspace/xDiT
+
+COPY . .
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clean conflicting packages from base image
+RUN pip uninstall -y torchvision flash-attn flash_attn \
+    opencv-python opencv-python-headless opencv-contrib-python || true
+RUN rm -rf /usr/local/lib/python3.10/dist-packages/cv2* \
+           /usr/local/lib/python3.10/dist-packages/opencv*.dist-info
+
+# Reinstall compatible versions
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 torchvision
+RUN pip install --no-cache-dir opencv-python-headless==4.10.0.84
+
+# Install xDiT with flash-attn + ray extras
+RUN pip install --no-cache-dir -e ".[flash-attn,ray]"
+
+# FastAPI + uvicorn for the HTTP service
+RUN pip install --no-cache-dir fastapi uvicorn[standard]
+
+# Models are mounted as a volume
+VOLUME /models
+
+EXPOSE 6000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:6000/health')" || exit 1
+
+ENTRYPOINT ["python", "entrypoints/service.py"]
+CMD ["--model_path", "/models/FLUX.1-dev", "--world_size", "4", "--ulysses_degree", "2", "--use_cfg_parallel"]
