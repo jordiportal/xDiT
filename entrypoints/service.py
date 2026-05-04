@@ -1,13 +1,15 @@
 """
-xDiT HTTP Service — Multi-model inference server with Ray + FastAPI.
+xDiT HTTP Service — On-demand multi-model inference server with Ray + FastAPI.
 
-Supports both image and video diffusion models with distributed inference.
+Models are loaded into GPU only when a request arrives and unloaded after
+an inactivity timeout (default 10 min). Supports T2V and I2V with automatic
+model switching.
 
 Usage:
     python entrypoints/service.py \
-        --model_path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-        --world_size 3 \
-        --fully_shard_degree 3
+        --t2v_model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+        --i2v_model Wan-AI/Wan2.2-I2V-A14B-Diffusers \
+        --world_size 4 --ulysses_degree 4 --fully_shard_degree 2
 """
 
 import os
@@ -15,9 +17,11 @@ import io
 import sys
 import time
 import base64
+import asyncio
 import logging
 import tempfile
 import argparse
+import threading
 from typing import Optional, List, Dict, Any
 
 import torch
@@ -34,6 +38,7 @@ from pydantic import BaseModel, Field
 class GenerateRequest(BaseModel):
     prompt: str
     negative_prompt: Optional[str] = None
+    image: Optional[str] = None  # base64 image for I2V
     height: Optional[int] = None
     width: Optional[int] = None
     num_inference_steps: Optional[int] = None
@@ -44,15 +49,15 @@ class GenerateRequest(BaseModel):
     flow_shift: Optional[float] = None
     seed: Optional[int] = 42
     output_format: Optional[str] = Field("auto", pattern="^(auto|png|jpeg|webp|mp4)$")
-    save_disk_path: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
     status: str
-    model: str
+    loaded_model: Optional[str] = None
+    available_models: Dict[str, str]
     world_size: int
-    output_type: str
     uptime_seconds: float
+    idle_timeout_seconds: int
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +68,11 @@ class HealthResponse(BaseModel):
 class InferenceWorker:
     """Each worker owns one GPU and its share of the distributed pipeline."""
 
-    def __init__(self, xfuser_args, rank: int, world_size: int):
+    def __init__(self, xfuser_args, rank: int, world_size: int, env_vars: dict = None):
+        if env_vars:
+            for k, v in env_vars.items():
+                os.environ[k] = v
+
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
         os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -110,18 +119,31 @@ class InferenceWorker:
 
     def _build_default_input_args(self) -> dict:
         dv = self.model.default_input_values
+        h = dv.height or 1024
+        w = dv.width or 1024
+
+        input_images = []
+        is_i2v = getattr(self.model.capabilities, "require_input_image", False) or \
+                 "i2v" in self.xfuser_args.model.lower()
+        if is_i2v:
+            from PIL import Image as PILImage
+            placeholder = PILImage.new("RGB", (w, h), color=(128, 128, 128))
+            input_images = [placeholder]
+
         args = {
             "prompt": "warmup",
             "negative_prompt": getattr(dv, "negative_prompt", None) or "",
-            "height": dv.height or 1024,
-            "width": dv.width or 1024,
+            "height": h,
+            "width": w,
             "num_inference_steps": dv.num_inference_steps or 28,
             "guidance_scale": dv.guidance_scale if dv.guidance_scale is not None else 3.5,
             "max_sequence_length": getattr(dv, "max_sequence_length", None) or 512,
             "seed": 42,
-            "input_images": [],
+            "input_images": input_images,
             "output_directory": "/tmp/xdit_output",
         }
+        if is_i2v:
+            args["image"] = input_images[0]
         if getattr(dv, "num_frames", None):
             args["num_frames"] = dv.num_frames
         if getattr(dv, "flow_shift", None) is not None:
@@ -147,6 +169,13 @@ class InferenceWorker:
             "output_directory": "/tmp/xdit_output",
         }
 
+        if req.get("image"):
+            from PIL import Image as PILImage
+            img_data = base64.b64decode(req["image"])
+            pil_img = PILImage.open(io.BytesIO(img_data)).convert("RGB")
+            input_args["input_images"] = [pil_img]
+            input_args["image"] = pil_img
+
         if getattr(dv, "num_frames", None):
             input_args["num_frames"] = req.get("num_frames") or dv.num_frames
         if hasattr(dv, "flow_shift"):
@@ -154,8 +183,9 @@ class InferenceWorker:
         if hasattr(dv, "guidance_scale_2"):
             input_args["guidance_scale_2"] = req.get("guidance_scale_2") if req.get("guidance_scale_2") is not None else dv.guidance_scale_2
 
+        mode = "I2V" if input_args["input_images"] else "T2V"
         print(
-            f"[XDIT] Generate: {input_args.get('width', 0)}x{input_args.get('height', 0)}, "
+            f"[XDIT] Generate ({mode}): {input_args.get('width', 0)}x{input_args.get('height', 0)}, "
             f"frames={input_args.get('num_frames', 'N/A')}, steps={input_args.get('num_inference_steps', '?')}, "
             f"guidance={input_args.get('guidance_scale', 0)}, seed={input_args.get('seed', '?')}, "
             f"prompt={input_args.get('prompt', '')[:80]}",
@@ -280,45 +310,130 @@ class InferenceWorker:
             "model_name": self.model.settings.model_name,
             "output_type": self.model.settings.model_output_type,
             "fps": getattr(self.model.settings, "fps", None),
-            "capabilities": {
-                k: getattr(self.model.capabilities, k)
-                for k in self.model.capabilities.__dataclass_fields__
-            },
-            "defaults": {
-                k: getattr(self.model.default_input_values, k)
-                for k in self.model.default_input_values.__dataclass_fields__
-                if getattr(self.model.default_input_values, k) is not None
-            },
         }
 
 
 # ---------------------------------------------------------------------------
-# Engine — orchestrates Ray workers
+# Engine — lazy loading with inactivity timeout
 # ---------------------------------------------------------------------------
 
 class Engine:
-    def __init__(self, world_size: int, xfuser_args):
+    def __init__(self, world_size: int, base_xfuser_kwargs: dict,
+                 t2v_model: str, i2v_model: Optional[str] = None,
+                 idle_timeout: int = 600):
         if not ray.is_initialized():
             ray.init(ignore_reinit_error=True)
 
         self.world_size = world_size
+        self.base_xfuser_kwargs = base_xfuser_kwargs
+        self.t2v_model = t2v_model
+        self.i2v_model = i2v_model
+        self.idle_timeout = idle_timeout
+
+        self.workers: List = []
+        self.loaded_model: Optional[str] = None
+        self._lock = asyncio.Lock()
+        self._unload_task: Optional[asyncio.Task] = None
+
+        logging.info(
+            "Engine initialized (lazy). T2V=%s, I2V=%s, timeout=%ds",
+            t2v_model, i2v_model or "not configured", idle_timeout,
+        )
+
+    def _determine_model(self, req: dict) -> str:
+        if req.get("image"):
+            if not self.i2v_model:
+                raise ValueError("I2V model not configured but request contains image")
+            return self.i2v_model
+        return self.t2v_model
+
+    async def _load_model(self, model_path: str):
+        """Load model into GPU workers."""
+        if self.loaded_model == model_path:
+            return
+
+        if self.workers:
+            await self._unload_workers()
+
+        logging.info("Loading model: %s (world_size=%d)...", model_path, self.world_size)
+        start = time.time()
+
+        from xfuser.config import xFuserArgs
+        kwargs = {**self.base_xfuser_kwargs, "model": model_path}
+        xfuser_args = xFuserArgs(**kwargs)
+
+        env_vars = {
+            k: os.environ[k] for k in
+            ("HF_TOKEN", "HF_HOME", "TRANSFORMERS_CACHE",
+             "HF_HUB_DISABLE_XET", "HF_HUB_OFFLINE")
+            if k in os.environ
+        }
+
         self.workers = [
-            InferenceWorker.remote(xfuser_args, rank=r, world_size=world_size)
-            for r in range(world_size)
+            InferenceWorker.remote(xfuser_args, rank=r, world_size=self.world_size,
+                                   env_vars=env_vars)
+            for r in range(self.world_size)
         ]
         results = ray.get([w.ping.remote() for w in self.workers])
-        logging.info("All workers ready: %s", results)
+        elapsed = time.time() - start
+        self.loaded_model = model_path
+        logging.info("Model loaded in %.1fs. Workers: %s", elapsed, results)
+
+    async def _unload_workers(self):
+        """Kill all workers and free GPU memory."""
+        if not self.workers:
+            return
+        logging.info("Unloading model: %s", self.loaded_model)
+        for w in self.workers:
+            ray.kill(w)
+        self.workers = []
+        self.loaded_model = None
+        logging.info("GPUs released.")
+
+    async def _schedule_unload(self):
+        """Schedule model unload after idle timeout."""
+        if self._unload_task and not self._unload_task.done():
+            self._unload_task.cancel()
+        self._unload_task = asyncio.create_task(self._idle_unload_timer())
+
+    async def _idle_unload_timer(self):
+        try:
+            await asyncio.sleep(self.idle_timeout)
+            async with self._lock:
+                if self.workers:
+                    logging.info("Idle timeout (%ds) reached. Unloading model.", self.idle_timeout)
+                    await self._unload_workers()
+        except asyncio.CancelledError:
+            pass
 
     async def generate(self, req: dict) -> dict:
+        async with self._lock:
+            needed_model = self._determine_model(req)
+
+            if self._unload_task and not self._unload_task.done():
+                self._unload_task.cancel()
+
+            await self._load_model(needed_model)
+
         futures = [w.generate.remote(req) for w in self.workers]
-        results = ray.get(futures)
+        results = await asyncio.get_event_loop().run_in_executor(
+            None, ray.get, futures
+        )
+
+        await self._schedule_unload()
+
         for r in results:
             if r is not None:
                 return r
         raise RuntimeError("No worker produced output")
 
-    def get_model_info(self) -> dict:
-        return ray.get(self.workers[0].get_model_info.remote())
+    def get_status(self) -> dict:
+        return {
+            "loaded_model": self.loaded_model,
+            "workers_active": len(self.workers),
+            "t2v_model": self.t2v_model,
+            "i2v_model": self.i2v_model,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -328,8 +443,8 @@ class Engine:
 START_TIME = time.time()
 app = FastAPI(
     title="xDiT Inference Service",
-    description="Multi-GPU parallel inference for Diffusion Transformers (image & video)",
-    version="2.0.0",
+    description="On-demand multi-GPU parallel inference for Diffusion Transformers",
+    version="3.0.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -342,31 +457,20 @@ engine: Engine = None
 _launch_args: dict = {}
 
 
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health")
 async def health():
-    info = engine.get_model_info()
-    return HealthResponse(
-        status="ok",
-        model=_launch_args.get("model_path", "unknown"),
-        world_size=_launch_args.get("world_size", 0),
-        output_type=info.get("output_type", "image"),
-        uptime_seconds=round(time.time() - START_TIME, 1),
-    )
-
-
-@app.get("/models")
-async def list_models():
-    info = engine.get_model_info()
+    status = engine.get_status()
+    models = {"t2v": engine.t2v_model}
+    if engine.i2v_model:
+        models["i2v"] = engine.i2v_model
     return {
-        "loaded": info,
+        "status": "ok",
+        "loaded_model": status["loaded_model"],
+        "available_models": models,
         "world_size": engine.world_size,
-        "parallel_config": {
-            "ulysses_degree": _launch_args.get("ulysses_degree", 1),
-            "ring_degree": _launch_args.get("ring_degree", 1),
-            "pipefusion_degree": _launch_args.get("pipefusion_degree", 1),
-            "fully_shard_degree": _launch_args.get("fully_shard_degree", 1),
-            "cfg_parallel": _launch_args.get("use_cfg_parallel", False),
-        },
+        "workers_active": status["workers_active"],
+        "uptime_seconds": round(time.time() - START_TIME, 1),
+        "idle_timeout_seconds": engine.idle_timeout,
     }
 
 
@@ -378,6 +482,8 @@ async def generate(request: GenerateRequest):
     try:
         result = await engine.generate(request.model_dump())
         return result
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except Exception as e:
         logging.exception("Generation failed")
         raise HTTPException(500, str(e))
@@ -389,9 +495,7 @@ async def generate_raw(request: GenerateRequest):
     if not request.prompt or not request.prompt.strip():
         raise HTTPException(400, "prompt is required")
 
-    req = request.model_dump()
-    req["save_disk_path"] = None
-    result = await engine.generate(req)
+    result = await engine.generate(request.model_dump())
 
     if result.get("type") == "video":
         video_data = result["videos"][0]
@@ -403,23 +507,37 @@ async def generate_raw(request: GenerateRequest):
         return Response(content=raw, media_type=img_data["mime"])
 
 
+@app.post("/unload")
+async def unload_model():
+    """Manually unload model from GPUs."""
+    async with engine._lock:
+        if engine._unload_task and not engine._unload_task.done():
+            engine._unload_task.cancel()
+        await engine._unload_workers()
+    return {"status": "unloaded"}
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="xDiT HTTP Inference Service")
-    p.add_argument("--model_path", type=str, required=True,
-                   help="HuggingFace model ID or local path")
-    p.add_argument("--world_size", type=int, default=4,
-                   help="Number of GPUs to use")
+    p = argparse.ArgumentParser(description="xDiT On-Demand HTTP Inference Service")
+    p.add_argument("--t2v_model", type=str, default="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+                   help="HuggingFace model ID for Text-to-Video")
+    p.add_argument("--i2v_model", type=str, default="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+                   help="HuggingFace model ID for Image-to-Video")
+    p.add_argument("--model_path", type=str, default=None,
+                   help="(Deprecated) Alias for --t2v_model")
+    p.add_argument("--world_size", type=int, default=4)
     p.add_argument("--ulysses_degree", type=int, default=1)
     p.add_argument("--ring_degree", type=int, default=1)
     p.add_argument("--pipefusion_degree", type=int, default=1)
     p.add_argument("--fully_shard_degree", type=int, default=1)
     p.add_argument("--use_cfg_parallel", action="store_true")
-    p.add_argument("--attention_backend", type=str, default=None,
-                   help="Attention backend: SDPA, SDPA_FLASH, SDPA_EFFICIENT, CUDNN, etc.")
+    p.add_argument("--attention_backend", type=str, default=None)
+    p.add_argument("--idle_timeout", type=int, default=600,
+                   help="Seconds of inactivity before unloading model from GPUs (default: 600)")
     p.add_argument("--host", type=str, default="0.0.0.0")
     p.add_argument("--port", type=int, default=6000)
     return p.parse_args()
@@ -430,20 +548,11 @@ if __name__ == "__main__":
                         format="%(asctime)s [SERVICE] %(levelname)s %(message)s")
 
     args = parse_args()
-    _launch_args = {
-        "model_path": args.model_path,
-        "world_size": args.world_size,
-        "ulysses_degree": args.ulysses_degree,
-        "ring_degree": args.ring_degree,
-        "pipefusion_degree": args.pipefusion_degree,
-        "fully_shard_degree": args.fully_shard_degree,
-        "use_cfg_parallel": args.use_cfg_parallel,
-    }
 
-    from xfuser.config import xFuserArgs
+    t2v_model = args.model_path or args.t2v_model
+    i2v_model = args.i2v_model
 
-    xfuser_kwargs = dict(
-        model=args.model_path,
+    base_xfuser_kwargs = dict(
         trust_remote_code=True,
         warmup_steps=0,
         use_parallel_vae=False,
@@ -457,18 +566,31 @@ if __name__ == "__main__":
         use_cfg_parallel=args.use_cfg_parallel,
     )
     if args.attention_backend:
-        xfuser_kwargs["attention_backend"] = args.attention_backend
+        base_xfuser_kwargs["attention_backend"] = args.attention_backend
 
-    xfuser_args = xFuserArgs(**xfuser_kwargs)
+    _launch_args = {
+        "t2v_model": t2v_model,
+        "i2v_model": i2v_model,
+        "world_size": args.world_size,
+        "ulysses_degree": args.ulysses_degree,
+        "fully_shard_degree": args.fully_shard_degree,
+        "idle_timeout": args.idle_timeout,
+    }
 
     logging.info(
-        "Starting xDiT service: model=%s gpus=%d ulysses=%d ring=%d pp=%d fsdp=%d cfg=%s",
-        args.model_path, args.world_size, args.ulysses_degree,
-        args.ring_degree, args.pipefusion_degree, args.fully_shard_degree,
-        args.use_cfg_parallel,
+        "Starting xDiT on-demand service: T2V=%s, I2V=%s, GPUs=%d, "
+        "ulysses=%d, fsdp=%d, idle_timeout=%ds",
+        t2v_model, i2v_model, args.world_size,
+        args.ulysses_degree, args.fully_shard_degree, args.idle_timeout,
     )
 
-    engine = Engine(world_size=args.world_size, xfuser_args=xfuser_args)
+    engine = Engine(
+        world_size=args.world_size,
+        base_xfuser_kwargs=base_xfuser_kwargs,
+        t2v_model=t2v_model,
+        i2v_model=i2v_model,
+        idle_timeout=args.idle_timeout,
+    )
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
