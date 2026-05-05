@@ -26,19 +26,29 @@ from typing import Optional, List, Dict, Any
 
 import torch
 import ray
-from fastapi import FastAPI, HTTPException
+from pathlib import Path
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+
+LORA_DIR = Path(os.environ.get("XDIT_LORA_DIR", "/workspace/loras"))
+LORA_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
 
+class LoraSpec(BaseModel):
+    name: str
+    weight: float = 1.0
+
+
 class GenerateRequest(BaseModel):
     prompt: str
     negative_prompt: Optional[str] = None
     image: Optional[str] = None  # base64 image for I2V
+    loras: Optional[List[LoraSpec]] = None
     height: Optional[int] = None
     width: Optional[int] = None
     num_inference_steps: Optional[int] = None
@@ -152,6 +162,52 @@ class InferenceWorker:
             args["guidance_scale_2"] = dv.guidance_scale_2
         return args
 
+    def _apply_loras(self, loras: List[dict]):
+        """Load and activate LoRA adapters on the pipeline."""
+        pipe = self.model.pipe
+        if not hasattr(pipe, "load_lora_weights"):
+            self.logger.warning("Pipeline does not support load_lora_weights, skipping LoRAs")
+            return
+
+        adapter_names = []
+        adapter_weights = []
+        for lora in loras:
+            name = lora["name"]
+            weight = lora.get("weight", 1.0)
+            lora_path = LORA_DIR / f"{name}.safetensors"
+            if not lora_path.exists():
+                lora_path = LORA_DIR / name
+            if not lora_path.exists():
+                for f in LORA_DIR.iterdir():
+                    if f.stem.lower() == name.lower():
+                        lora_path = f
+                        break
+            if not lora_path.exists():
+                self.logger.warning("LoRA file not found: %s", name)
+                continue
+
+            self.logger.info("Loading LoRA: %s (weight=%.2f)", lora_path.name, weight)
+            pipe.load_lora_weights(
+                str(lora_path),
+                adapter_name=name,
+            )
+            adapter_names.append(name)
+            adapter_weights.append(weight)
+
+        if adapter_names:
+            pipe.set_adapters(adapter_names, adapter_weights=adapter_weights)
+            self.logger.info("Active LoRAs: %s", list(zip(adapter_names, adapter_weights)))
+
+    def _unload_loras(self):
+        """Remove all LoRA adapters from the pipeline."""
+        pipe = self.model.pipe
+        if not hasattr(pipe, "unload_lora_weights"):
+            return
+        try:
+            pipe.unload_lora_weights()
+        except Exception as e:
+            self.logger.warning("Error unloading LoRAs: %s", e)
+
     def generate(self, req: dict) -> Optional[dict]:
         from xfuser.model_executor.models.runner_models.base_model import DiffusionOutput
 
@@ -183,17 +239,27 @@ class InferenceWorker:
         if hasattr(dv, "guidance_scale_2"):
             input_args["guidance_scale_2"] = req.get("guidance_scale_2") if req.get("guidance_scale_2") is not None else dv.guidance_scale_2
 
+        # Apply LoRAs if requested
+        loras = req.get("loras") or []
+        if loras:
+            self._apply_loras(loras)
+
         mode = "I2V" if input_args["input_images"] else "T2V"
+        lora_info = f", loras={[l['name'] for l in loras]}" if loras else ""
         print(
             f"[XDIT] Generate ({mode}): {input_args.get('width', 0)}x{input_args.get('height', 0)}, "
             f"frames={input_args.get('num_frames', 'N/A')}, steps={input_args.get('num_inference_steps', '?')}, "
-            f"guidance={input_args.get('guidance_scale', 0)}, seed={input_args.get('seed', '?')}, "
+            f"guidance={input_args.get('guidance_scale', 0)}, seed={input_args.get('seed', '?')}{lora_info}, "
             f"prompt={input_args.get('prompt', '')[:80]}",
             flush=True,
         )
 
         start = time.time()
-        output, timings = self.model.run(input_args)
+        try:
+            output, timings = self.model.run(input_args)
+        finally:
+            if loras:
+                self._unload_loras()
         elapsed = time.time() - start
 
         from xfuser.core.utils.runner_utils import is_last_process
@@ -463,6 +529,8 @@ async def health():
     models = {"t2v": engine.t2v_model}
     if engine.i2v_model:
         models["i2v"] = engine.i2v_model
+    lora_count = sum(1 for f in LORA_DIR.iterdir()
+                     if f.suffix.lower() in (".safetensors", ".pt", ".bin"))
     return {
         "status": "ok",
         "loaded_model": status["loaded_model"],
@@ -471,6 +539,8 @@ async def health():
         "workers_active": status["workers_active"],
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "idle_timeout_seconds": engine.idle_timeout,
+        "lora_count": lora_count,
+        "lora_dir": str(LORA_DIR),
     }
 
 
@@ -518,6 +588,56 @@ async def unload_model():
 
 
 # ---------------------------------------------------------------------------
+# LoRA management endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/loras")
+async def list_loras():
+    """List available LoRA files."""
+    loras = []
+    for f in sorted(LORA_DIR.iterdir()):
+        if f.suffix.lower() in (".safetensors", ".pt", ".bin"):
+            loras.append({
+                "name": f.stem,
+                "filename": f.name,
+                "size_mb": round(f.stat().st_size / (1024 * 1024), 1),
+            })
+    return {"loras": loras}
+
+
+@app.post("/loras/upload")
+async def upload_lora(file: UploadFile = File(...)):
+    """Upload a LoRA file (.safetensors)."""
+    if not file.filename:
+        raise HTTPException(400, "filename is required")
+
+    safe_name = Path(file.filename).name
+    if not safe_name.lower().endswith((".safetensors", ".pt", ".bin")):
+        raise HTTPException(400, "Only .safetensors, .pt, .bin files allowed")
+
+    dest = LORA_DIR / safe_name
+    content = await file.read()
+    dest.write_bytes(content)
+    logging.info("LoRA uploaded: %s (%.1f MB)", safe_name, len(content) / (1024 * 1024))
+    return {"status": "ok", "filename": safe_name, "size_mb": round(len(content) / (1024 * 1024), 1)}
+
+
+@app.delete("/loras/{name}")
+async def delete_lora(name: str):
+    """Delete a LoRA file by stem name or full filename."""
+    target = None
+    for f in LORA_DIR.iterdir():
+        if f.name == name or f.stem == name:
+            target = f
+            break
+    if not target or not target.exists():
+        raise HTTPException(404, f"LoRA '{name}' not found")
+    target.unlink()
+    logging.info("LoRA deleted: %s", target.name)
+    return {"status": "deleted", "filename": target.name}
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -538,6 +658,8 @@ def parse_args():
     p.add_argument("--attention_backend", type=str, default=None)
     p.add_argument("--idle_timeout", type=int, default=600,
                    help="Seconds of inactivity before unloading model from GPUs (default: 600)")
+    p.add_argument("--lora_dir", type=str, default="/workspace/loras",
+                   help="Directory for LoRA files (default: /workspace/loras)")
     p.add_argument("--host", type=str, default="0.0.0.0")
     p.add_argument("--port", type=int, default=6000)
     return p.parse_args()
@@ -548,6 +670,11 @@ if __name__ == "__main__":
                         format="%(asctime)s [SERVICE] %(levelname)s %(message)s")
 
     args = parse_args()
+
+    # Override LoRA directory from CLI if provided
+    global LORA_DIR
+    LORA_DIR = Path(args.lora_dir)
+    LORA_DIR.mkdir(parents=True, exist_ok=True)
 
     t2v_model = args.model_path or args.t2v_model
     i2v_model = args.i2v_model
