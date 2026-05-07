@@ -7,11 +7,11 @@ WORKDIR /workspace/xDiT
 
 # Python dependencies (pre-installed, no pip on startup)
 RUN pip install --no-cache-dir \
-        --upgrade transformers diffusers accelerate \
+        --upgrade transformers diffusers accelerate peft \
     && pip install --no-cache-dir \
         'https://github.com/xdit-project/xDiT/archive/refs/heads/main.tar.gz' \
     && pip install --no-cache-dir \
-        'ray[default]' fastapi uvicorn imageio-ffmpeg
+        'ray[default]' fastapi uvicorn imageio-ffmpeg ftfy
 
 # Patch xfuser bug: get_device_properties() missing device arg
 RUN XFUSER_LOC=$(pip show xfuser 2>/dev/null | grep '^Location:' | cut -d' ' -f2) \
@@ -21,12 +21,18 @@ RUN XFUSER_LOC=$(pip show xfuser 2>/dev/null | grep '^Location:' | cut -d' ' -f2
 # Copy service entrypoint
 COPY entrypoints/service.py ./entrypoints/service.py
 
-# Models and HF cache are mounted as volumes
-VOLUME ["/workspace/hf_cache"]
+# Patch wan.py runner model to support progress callbacks
+COPY xfuser/model_executor/models/runner_models/wan.py \
+     /opt/conda/lib/python3.11/site-packages/xfuser/model_executor/models/runner_models/wan.py
+
+# Models, LoRAs, and HF cache should be mounted as named volumes:
+#   -v xdit-hf-cache:/workspace/hf_cache -v xdit-loras:/workspace/loras
+RUN mkdir -p /workspace/hf_cache /workspace/loras
 
 ENV HF_HOME=/workspace/hf_cache \
     TRANSFORMERS_CACHE=/workspace/hf_cache \
     HF_HUB_DISABLE_XET=1 \
+    XDIT_LORA_DIR=/workspace/loras \
     NCCL_P2P_DISABLE=0 \
     NCCL_IB_DISABLE=1 \
     NCCL_DEBUG=WARN
@@ -37,6 +43,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:6000/health')" || exit 1
 
 ENTRYPOINT ["python", "entrypoints/service.py"]
-CMD ["--model_path", "Wan-AI/Wan2.2-T2V-A14B-Diffusers", \
-     "--world_size", "4", "--ulysses_degree", "4", "--fully_shard_degree", "2", \
+CMD ["--t2v_model", "Wan-AI/Wan2.2-T2V-A14B-Diffusers", \
+     "--i2v_model", "Wan-AI/Wan2.2-I2V-A14B-Diffusers", \
+     "--world_size", "8", "--ulysses_degree", "4", "--fully_shard_degree", "2", \
      "--attention_backend", "SDPA", "--host", "0.0.0.0", "--port", "6000"]

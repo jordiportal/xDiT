@@ -74,7 +74,7 @@ class HealthResponse(BaseModel):
 # Ray worker — one per GPU
 # ---------------------------------------------------------------------------
 
-@ray.remote(num_gpus=1)
+@ray.remote(num_gpus=1, max_concurrency=2)
 class InferenceWorker:
     """Each worker owns one GPU and its share of the distributed pipeline."""
 
@@ -89,6 +89,9 @@ class InferenceWorker:
         os.environ["MASTER_PORT"] = "29500"
 
         self.rank = rank
+        self._current_step = 0
+        self._total_steps = 0
+        self._gen_start_time = 0.0
         self.logger = logging.getLogger(f"xdit.worker.{rank}")
         logging.basicConfig(level=logging.INFO,
                             format=f"%(asctime)s [W{rank}] %(levelname)s %(message)s")
@@ -208,21 +211,46 @@ class InferenceWorker:
         except Exception as e:
             self.logger.warning("Error unloading LoRAs: %s", e)
 
+    def get_progress(self) -> dict:
+        """Return current generation progress (callable concurrently with generate)."""
+        if self._gen_start_time > 0:
+            elapsed = round(time.time() - self._gen_start_time, 1)
+        else:
+            elapsed = 0.0
+        return {
+            "current_step": self._current_step,
+            "total_steps": self._total_steps,
+            "elapsed": elapsed,
+        }
+
+    def _make_step_callback(self):
+        """Create a callback that updates progress on each denoising step."""
+        def _on_step(pipe, step_index, timestep, callback_kwargs):
+            self._current_step = step_index + 1
+            return callback_kwargs
+        return _on_step
+
     def generate(self, req: dict) -> Optional[dict]:
         from xfuser.model_executor.models.runner_models.base_model import DiffusionOutput
 
         dv = self.model.default_input_values
+        num_steps = req.get("num_inference_steps") or dv.num_inference_steps or 28
+        self._total_steps = num_steps
+        self._current_step = 0
+        self._gen_start_time = time.time()
+
         input_args = {
             "prompt": req["prompt"],
             "negative_prompt": req.get("negative_prompt") or getattr(dv, "negative_prompt", None) or "",
             "height": req.get("height") or dv.height or 1024,
             "width": req.get("width") or dv.width or 1024,
-            "num_inference_steps": req.get("num_inference_steps") or dv.num_inference_steps or 28,
+            "num_inference_steps": num_steps,
             "guidance_scale": req.get("guidance_scale") if req.get("guidance_scale") is not None else (dv.guidance_scale if dv.guidance_scale is not None else 3.5),
             "max_sequence_length": req.get("max_sequence_length") or getattr(dv, "max_sequence_length", None) or 512,
             "seed": req.get("seed", 42),
             "input_images": [],
             "output_directory": "/tmp/xdit_output",
+            "_step_callback": self._make_step_callback(),
         }
 
         if req.get("image"):
@@ -248,7 +276,7 @@ class InferenceWorker:
         lora_info = f", loras={[l['name'] for l in loras]}" if loras else ""
         print(
             f"[XDIT] Generate ({mode}): {input_args.get('width', 0)}x{input_args.get('height', 0)}, "
-            f"frames={input_args.get('num_frames', 'N/A')}, steps={input_args.get('num_inference_steps', '?')}, "
+            f"frames={input_args.get('num_frames', 'N/A')}, steps={num_steps}, "
             f"guidance={input_args.get('guidance_scale', 0)}, seed={input_args.get('seed', '?')}{lora_info}, "
             f"prompt={input_args.get('prompt', '')[:80]}",
             flush=True,
@@ -260,6 +288,7 @@ class InferenceWorker:
         finally:
             if loras:
                 self._unload_loras()
+            self._gen_start_time = 0.0
         elapsed = time.time() - start
 
         from xfuser.core.utils.runner_utils import is_last_process
@@ -493,6 +522,19 @@ class Engine:
                 return r
         raise RuntimeError("No worker produced output")
 
+    async def get_progress(self) -> dict:
+        """Query worker 0 for generation progress."""
+        if not self.workers:
+            return {"generating": False, "current_step": 0, "total_steps": 0, "elapsed": 0}
+        try:
+            progress = await asyncio.get_event_loop().run_in_executor(
+                None, ray.get, self.workers[0].get_progress.remote()
+            )
+            generating = progress["total_steps"] > 0 and progress["current_step"] < progress["total_steps"]
+            return {**progress, "generating": generating}
+        except Exception:
+            return {"generating": False, "current_step": 0, "total_steps": 0, "elapsed": 0}
+
     def get_status(self) -> dict:
         return {
             "loaded_model": self.loaded_model,
@@ -557,6 +599,29 @@ async def generate(request: GenerateRequest):
     except Exception as e:
         logging.exception("Generation failed")
         raise HTTPException(500, str(e))
+
+
+@app.get("/generate/progress")
+async def get_generation_progress():
+    """Return real-time generation progress (step-level)."""
+    progress = await engine.get_progress()
+    total = progress["total_steps"]
+    current = progress["current_step"]
+    elapsed = progress.get("elapsed", 0)
+
+    percent = int(current / total * 100) if total > 0 else 0
+    eta_seconds = None
+    if current > 0 and total > 0 and current < total:
+        eta_seconds = round(elapsed / current * (total - current), 1)
+
+    return {
+        "generating": progress["generating"],
+        "current_step": current,
+        "total_steps": total,
+        "percent": percent,
+        "elapsed_seconds": elapsed,
+        "eta_seconds": eta_seconds,
+    }
 
 
 @app.post("/generate/raw")
@@ -658,8 +723,6 @@ def parse_args():
     p.add_argument("--attention_backend", type=str, default=None)
     p.add_argument("--idle_timeout", type=int, default=600,
                    help="Seconds of inactivity before unloading model from GPUs (default: 600)")
-    p.add_argument("--lora_dir", type=str, default="/workspace/loras",
-                   help="Directory for LoRA files (default: /workspace/loras)")
     p.add_argument("--host", type=str, default="0.0.0.0")
     p.add_argument("--port", type=int, default=6000)
     return p.parse_args()
@@ -670,11 +733,6 @@ if __name__ == "__main__":
                         format="%(asctime)s [SERVICE] %(levelname)s %(message)s")
 
     args = parse_args()
-
-    # Override LoRA directory from CLI if provided
-    global LORA_DIR
-    LORA_DIR = Path(args.lora_dir)
-    LORA_DIR.mkdir(parents=True, exist_ok=True)
 
     t2v_model = args.model_path or args.t2v_model
     i2v_model = args.i2v_model

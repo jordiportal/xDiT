@@ -128,18 +128,21 @@ class xFuserWan21I2VModel(xFuserModel):
         return pipe
 
     def _run_pipe(self, input_args: dict) -> DiffusionOutput:
-        output = self.pipe(
-            image=input_args["image"],
-            height=input_args["height"],
-            width=input_args["width"],
-            prompt=input_args["prompt"],
-            negative_prompt=input_args["negative_prompt"],
-            num_inference_steps=input_args["num_inference_steps"],
-            num_frames=input_args["num_frames"],
-            guidance_scale=input_args["guidance_scale"],
-            guidance_scale_2=input_args["guidance_scale_2"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
-        )
+        kwargs = {
+            "image": input_args["image"],
+            "height": input_args["height"],
+            "width": input_args["width"],
+            "prompt": input_args["prompt"],
+            "negative_prompt": input_args["negative_prompt"],
+            "num_inference_steps": input_args["num_inference_steps"],
+            "num_frames": input_args["num_frames"],
+            "guidance_scale": input_args["guidance_scale"],
+            "guidance_scale_2": input_args["guidance_scale_2"],
+            "generator": torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+        }
+        if input_args.get("_step_callback"):
+            kwargs["callback_on_step_end"] = input_args["_step_callback"]
+        output = self.pipe(**kwargs)
         return DiffusionOutput(videos=output.frames, pipe_args=input_args)
 
     def _preprocess_args_images(self, input_args: dict) -> dict:
@@ -281,17 +284,20 @@ class xFuserWan21T2VModel(xFuserModel):
         return pipe
 
     def _run_pipe(self, input_args: dict) -> DiffusionOutput:
-        output = self.pipe(
-            height=input_args["height"],
-            width=input_args["width"],
-            prompt=input_args["prompt"],
-            negative_prompt=input_args["negative_prompt"],
-            num_inference_steps=input_args["num_inference_steps"],
-            num_frames=input_args["num_frames"],
-            guidance_scale=input_args["guidance_scale"],
-            guidance_scale_2=input_args["guidance_scale_2"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
-        )
+        kwargs = {
+            "height": input_args["height"],
+            "width": input_args["width"],
+            "prompt": input_args["prompt"],
+            "negative_prompt": input_args["negative_prompt"],
+            "num_inference_steps": input_args["num_inference_steps"],
+            "num_frames": input_args["num_frames"],
+            "guidance_scale": input_args["guidance_scale"],
+            "guidance_scale_2": input_args["guidance_scale_2"],
+            "generator": torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+        }
+        if input_args.get("_step_callback"):
+            kwargs["callback_on_step_end"] = input_args["_step_callback"]
+        output = self.pipe(**kwargs)
         return DiffusionOutput(videos=output.frames, pipe_args=input_args)
 
     def _compile_model(self, input_args):
@@ -415,6 +421,8 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
         }
         if self.config.task == "i2v":
             kwargs["image"] = input_args["image"]
+        if input_args.get("_step_callback"):
+            kwargs["callback_on_step_end"] = input_args["_step_callback"]
         output = self.pipe(**kwargs)
         return DiffusionOutput(videos=output.frames, pipe_args=input_args)
 
@@ -529,18 +537,21 @@ class xFuserWan21VACEModel(xFuserModel):
         return input_args
 
     def _run_pipe(self, input_args: dict) -> DiffusionOutput:
-        output = self.pipe(
-            height=input_args["height"],
-            width=input_args["width"],
-            prompt=input_args["prompt"],
-            negative_prompt=input_args["negative_prompt"],
-            num_inference_steps=input_args["num_inference_steps"],
-            num_frames=input_args["num_frames"],
-            guidance_scale=input_args["guidance_scale"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
-            video=input_args["video"],
-            mask=input_args["mask"],
-        )
+        kwargs = {
+            "height": input_args["height"],
+            "width": input_args["width"],
+            "prompt": input_args["prompt"],
+            "negative_prompt": input_args["negative_prompt"],
+            "num_inference_steps": input_args["num_inference_steps"],
+            "num_frames": input_args["num_frames"],
+            "guidance_scale": input_args["guidance_scale"],
+            "generator": torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            "video": input_args["video"],
+            "mask": input_args["mask"],
+        }
+        if input_args.get("_step_callback"):
+            kwargs["callback_on_step_end"] = input_args["_step_callback"]
+        output = self.pipe(**kwargs)
         return DiffusionOutput(videos=output.frames, pipe_args=input_args)
 
     def _validate_args(self, input_args: dict) -> None:

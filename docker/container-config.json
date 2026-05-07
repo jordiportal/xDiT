@@ -1,0 +1,42 @@
+{
+  "Image": "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime",
+  "Env": [
+    "HF_HOME=/workspace/hf_cache",
+    "HF_TOKEN=<YOUR_HF_TOKEN>",
+    "HF_HUB_DISABLE_XET=1",
+    "HF_HUB_OFFLINE=0",
+    "TRANSFORMERS_CACHE=/workspace/hf_cache",
+    "XDIT_LORA_DIR=/workspace/loras",
+    "NCCL_P2P_DISABLE=0",
+    "NCCL_IB_DISABLE=1",
+    "NCCL_DEBUG=WARN",
+    "NVIDIA_VISIBLE_DEVICES=3,4,5,6"
+  ],
+  "WorkingDir": "/workspace/xDiT",
+  "Entrypoint": [
+    "bash",
+    "-c",
+    "pip install --upgrade transformers diffusers accelerate peft ftfy python-multipart 'ray[default]' fastapi uvicorn imageio-ffmpeg 'https://github.com/xdit-project/xDiT/archive/refs/heads/main.tar.gz' 2>&1 | tail -5 && XFUSER_LOC=$(pip show xfuser 2>/dev/null | grep Location | cut -d' ' -f2) && sed -i 's/torch.cuda.get_device_properties().gcnArchName/torch.cuda.get_device_properties(0).gcnArchName/g' $XFUSER_LOC/xfuser/envs.py && cp /workspace/xDiT/wan_patched.py $XFUSER_LOC/xfuser/model_executor/models/runner_models/wan.py && echo All patched, starting service... && export CUDA_VISIBLE_DEVICES=0,1,2,3 && exec python entrypoints/service.py --t2v_model Wan-AI/Wan2.2-T2V-A14B-Diffusers --i2v_model Wan-AI/Wan2.2-I2V-A14B-Diffusers --world_size 4 --ulysses_degree 4 --fully_shard_degree 2 --attention_backend SDPA --host 0.0.0.0 --port 6000"
+  ],
+  "ExposedPorts": {"6000/tcp": {}},
+  "HostConfig": {
+    "Binds": [
+      "xdit-workspace:/workspace",
+      "xdit-hf-cache:/workspace/hf_cache",
+      "xdit-loras:/workspace/loras"
+    ],
+    "PortBindings": {"6000/tcp": [{"HostPort": "6000"}]},
+    "IpcMode": "host",
+    "ShmSize": 17179869184,
+    "Runtime": "nvidia",
+    "DeviceRequests": [{"DeviceIDs": ["3","4","5","6"], "Capabilities": [["gpu"]]}],
+    "RestartPolicy": {"Name": "unless-stopped"}
+  },
+  "Healthcheck": {
+    "Test": ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:6000/health')\" || exit 1"],
+    "Interval": 30000000000,
+    "Timeout": 10000000000,
+    "StartPeriod": 300000000000,
+    "Retries": 3
+  }
+}
